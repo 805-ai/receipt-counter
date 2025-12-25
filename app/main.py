@@ -7,20 +7,30 @@ Patent Pending: US 63/926,683, US 63/917,247
 © 2025 Final Boss Technology, Inc. All rights reserved.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+from contextlib import asynccontextmanager
 import uuid
 import os
 
 from .penny_counter import counter
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize MongoDB connection on startup."""
+    await counter.initialize()
+    yield
+
+
 app = FastAPI(
     title="Receipt Counter",
     description="Track cryptographic receipts toward 1M goal",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -219,7 +229,7 @@ async def submit_receipt(submission: ReceiptSubmission):
 
 
 @app.post("/batch")
-async def submit_batch(batch: BatchSubmission):
+async def submit_batch(batch: BatchSubmission, background_tasks: BackgroundTasks):
     """
     Submit multiple receipts at once.
 
@@ -228,13 +238,13 @@ async def submit_batch(batch: BatchSubmission):
     if batch.count > 100_000:
         raise HTTPException(status_code=400, detail="Max 100,000 per batch")
 
-    for i in range(batch.count):
-        counter.record_operation(
-            receipt_id=f"BATCH-{uuid.uuid4().hex[:12]}",
-            tenant_id=batch.tenant_id or "batch",
-            operation_type="batch_sign",
-            resource_type="receipt",
-        )
+    tenant_id = batch.tenant_id or "batch"
+
+    # Fast in-memory update
+    counter.record_batch(batch.count, tenant_id)
+
+    # Persist to MongoDB in background
+    background_tasks.add_task(counter._persist_batch, batch.count, tenant_id)
 
     return {
         "counted": batch.count,

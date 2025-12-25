@@ -1,5 +1,5 @@
 """
-Penny Counter Implementation
+Penny Counter Implementation with MongoDB Persistence
 
 Patent Reference: "CDT + Penny Counter for AI-Driven Billing and Compliance"
 Patent Pending: US 63/926,683, US 63/917,247
@@ -10,7 +10,7 @@ data to payment processing system (Stripe) for settlement."
 
 Key Innovation: Every governance operation is metered and billable.
 
-© 2025 Final Boss Technology, Inc. All rights reserved.
+(c) 2025 Final Boss Technology, Inc. All rights reserved.
 """
 
 from dataclasses import dataclass, field
@@ -18,10 +18,29 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from enum import Enum
 from threading import Lock
-import json
+import os
 import logging
 
 logger = logging.getLogger(__name__)
+
+# MongoDB connection
+MONGODB_URI = os.environ.get("MONGODB_URI", "")
+DB_NAME = os.environ.get("DB_NAME", "receipt_counter")
+
+# Async MongoDB client (initialized on first request)
+_mongo_client = None
+_db = None
+
+
+def get_db():
+    """Get MongoDB database connection."""
+    global _mongo_client, _db
+    if _mongo_client is None and MONGODB_URI:
+        from motor.motor_asyncio import AsyncIOMotorClient
+        _mongo_client = AsyncIOMotorClient(MONGODB_URI)
+        _db = _mongo_client[DB_NAME]
+        logger.info(f"Connected to MongoDB: {DB_NAME}")
+    return _db
 
 
 class BillingTier(Enum):
@@ -90,7 +109,7 @@ class TenantUsage:
 
 class PennyCounter:
     """
-    The Penny Counter billing engine.
+    The Penny Counter billing engine with MongoDB persistence.
 
     Patent: "Incrementing usage counter associated with receipt.
     Transmitting billing data to payment processing system for settlement."
@@ -119,6 +138,7 @@ class PennyCounter:
         self._lock = Lock()
         self._counter = 0
         self._global_receipt_count = 0
+        self._initialized = False
 
         self._tier_multipliers = {
             BillingTier.FREE: 0.0,
@@ -126,6 +146,101 @@ class PennyCounter:
             BillingTier.PROFESSIONAL: 0.8,
             BillingTier.ENTERPRISE: 0.5,
         }
+
+    async def initialize(self):
+        """Load count from MongoDB on startup."""
+        if self._initialized:
+            return
+
+        db = get_db()
+        if db is not None:
+            try:
+                # Get the global counter document
+                counters = db["counters"]
+                doc = await counters.find_one({"_id": "global"})
+                if doc:
+                    self._global_receipt_count = doc.get("count", 0)
+                    self._counter = doc.get("record_counter", 0)
+                    logger.info(f"Loaded count from MongoDB: {self._global_receipt_count}")
+                else:
+                    # Initialize counter document
+                    await counters.insert_one({
+                        "_id": "global",
+                        "count": 0,
+                        "record_counter": 0,
+                        "created_at": datetime.now(timezone.utc).isoformat()
+                    })
+                    logger.info("Initialized new counter in MongoDB")
+
+                # Count tenants
+                tenants = await db["receipts"].distinct("tenant_id")
+                for tenant_id in tenants:
+                    count = await db["receipts"].count_documents({"tenant_id": tenant_id})
+                    self._tenant_usage[tenant_id] = TenantUsage(
+                        tenant_id=tenant_id,
+                        period_start="",
+                        period_end="",
+                        total_receipts=count,
+                        total_operations=count,
+                    )
+
+                self._initialized = True
+            except Exception as e:
+                logger.error(f"MongoDB init error: {e}")
+        else:
+            logger.warning("No MONGODB_URI set - running in memory-only mode")
+            self._initialized = True
+
+    async def _persist_receipt(self, record: UsageRecord):
+        """Persist a receipt to MongoDB."""
+        db = get_db()
+        if db is None:
+            return
+
+        try:
+            # Insert receipt
+            await db["receipts"].insert_one(record.to_dict())
+
+            # Update global counter atomically
+            await db["counters"].update_one(
+                {"_id": "global"},
+                {
+                    "$inc": {"count": 1, "record_counter": 1},
+                    "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}
+                },
+                upsert=True
+            )
+        except Exception as e:
+            logger.error(f"MongoDB persist error: {e}")
+
+    async def _persist_batch(self, count: int, tenant_id: str):
+        """Persist a batch count to MongoDB (without individual records)."""
+        db = get_db()
+        if db is None:
+            return
+
+        try:
+            # Update global counter atomically
+            await db["counters"].update_one(
+                {"_id": "global"},
+                {
+                    "$inc": {"count": count, "record_counter": count},
+                    "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}
+                },
+                upsert=True
+            )
+
+            # Update tenant counter
+            await db["tenant_counters"].update_one(
+                {"_id": tenant_id},
+                {
+                    "$inc": {"count": count},
+                    "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}
+                },
+                upsert=True
+            )
+        except Exception as e:
+            logger.error(f"MongoDB batch persist error: {e}")
 
     def record_operation(
         self,
@@ -177,6 +292,9 @@ class PennyCounter:
         )
 
         with self._lock:
+            # Keep only last 1000 in memory for stats
+            if len(self._records) > 1000:
+                self._records = self._records[-500:]
             self._records.append(record)
 
             if tenant_id not in self._tenant_usage:
@@ -192,9 +310,26 @@ class PennyCounter:
             tenant.total_tokens += tokens_processed
             tenant.total_cost_cents += total_cost
             tenant.period_end = record.timestamp
-            tenant.records.append(record)
 
         return record
+
+    def record_batch(self, count: int, tenant_id: str):
+        """Record a batch of receipts (fast path for bulk generation)."""
+        with self._lock:
+            self._counter += count
+            self._global_receipt_count += count
+
+            if tenant_id not in self._tenant_usage:
+                self._tenant_usage[tenant_id] = TenantUsage(
+                    tenant_id=tenant_id,
+                    period_start=datetime.now(timezone.utc).isoformat(),
+                    period_end=datetime.now(timezone.utc).isoformat(),
+                )
+
+            tenant = self._tenant_usage[tenant_id]
+            tenant.total_operations += count
+            tenant.total_receipts += count
+            tenant.period_end = datetime.now(timezone.utc).isoformat()
 
     def get_global_count(self) -> int:
         """Get global receipt count."""
@@ -210,6 +345,7 @@ class PennyCounter:
                 "total_records": len(self._records),
                 "goal": 1_000_000,
                 "progress_percent": round(self._global_receipt_count / 1_000_000 * 100, 4),
+                "persistent": MONGODB_URI != "",
             }
 
     def get_tenant_usage(self, tenant_id: str) -> Optional[TenantUsage]:

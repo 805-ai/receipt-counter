@@ -15,7 +15,7 @@ import aiohttp
 import time
 from datetime import datetime
 
-COUNTER_URL = "https://receipts.finalbosstech.com"  # Update when deployed
+COUNTER_URL = "https://receipts.finalbosstech.com"
 
 
 async def submit_batch(session: aiohttp.ClientSession, count: int, tenant_id: str):
